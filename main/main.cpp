@@ -40,7 +40,7 @@
 
 static const char *TAG = "csi_recv_router";
 
-#define WIFI_SSID      "BananaFi-2G"
+#define WIFI_SSID      "BananaFi-5G"
 #define WIFI_PASS      "haruhiyo01040312"
 
 static EventGroupHandle_t wifi_event_group;
