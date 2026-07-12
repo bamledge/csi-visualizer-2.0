@@ -6,6 +6,7 @@
 #ifndef __ESP32LGFX_HPP__
 #define __ESP32LGFX_HPP__
 
+// For ESP32-C5(Waveshare)
 #define VSPI_CLK  (24)
 #define VSPI_MISO  (8)
 #define VSPI_MOSI  (9)
@@ -13,6 +14,17 @@
 #define VSPI_DC    (23)
 #define VSPI_RST   (25)
 #define VSPI_CS2   (27)
+
+// For ESP32 WROOM
+/*
+#define VSPI_CLK  (18)
+#define VSPI_MISO  (19)
+#define VSPI_MOSI  (23)
+#define VSPI_CS    (5)
+#define VSPI_DC    (13)
+#define VSPI_RST   (14)
+#define VSPI_CS2   (4)
+*/
 
 #define ROT0   (0)
 #define ROT90  (1)
