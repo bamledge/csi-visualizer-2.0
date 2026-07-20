@@ -75,6 +75,7 @@ typedef struct comp {
 static csi_t heltf_raw[CSI_SIZE_HE_LTF], heltf[CSI_SIZE_HE_LTF];
 static float heltf_amp = -1;
 static unsigned int rssi;
+static unsigned int non_he_pkt_count = 0;
 
 const float CSI_ZOOM_RATIO = 50.0;
 const float CSI_AMP_THRESHOLD = 10.0;
@@ -282,6 +283,11 @@ static void wifi_csi_rx_cb(void *ctx, wifi_csi_info_t *info)
     //ets_printf("]\"\n");
     s_count++;
 
+    if (rx_ctrl->cur_bb_format != RX_BB_FORMAT_HE_SU) {
+        non_he_pkt_count++;
+        return;
+    }
+
     for (int k = 0; k < CSI_SIZE_HE_LTF; k++) {
         // HE-LTF
         heltf_raw[k].re = (float) info->buf[k * 2];
@@ -306,9 +312,7 @@ static void wifi_csi_init()
     wifi_csi_config_t csi_config = {
         .enable                   = true,
         .acquire_csi_legacy       = true,
-//        .acquire_csi_legacy       = false,
         .acquire_csi_force_lltf   = CSI_FORCE_LLTF,
-//        .acquire_csi_force_lltf   = CSI_FORCE_LLTF,
         .acquire_csi_ht20         = true,
         .acquire_csi_ht40         = true,
         .acquire_csi_vht          = true,
@@ -364,7 +368,8 @@ static esp_err_t wifi_ping_router_start()
 
     esp_ping_config_t ping_config = ESP_PING_DEFAULT_CONFIG();
     ping_config.count             = 0;
-    ping_config.interval_ms       = 100 / CONFIG_SEND_FREQUENCY;
+    ping_config.interval_ms       = 1000 / CONFIG_SEND_FREQUENCY;
+    ping_config.timeout_ms        = 20;
     ping_config.task_stack_size   = 3072;
     ping_config.data_size         = 1;
 
@@ -414,9 +419,10 @@ void connect_csi_plots(csi_t *csi, int color, float amplitude) {
   for (int k = CSI_SUBCARRIER_START_H; k < CSI_SUBCARRIER_END_H; k++) {
     x = _hw + (csi[k].re * CSI_ZOOM_RATIO);
     y = _hh + (csi[k].im * CSI_ZOOM_RATIO);
-    //if (k != CSI_SUBCARRIER_START_H) {
+    if (k != CSI_SUBCARRIER_START_H) {
       spr.drawLine(last_x, last_y, x, y, color);
-    //}
+      //spr.drawLine(last_x, last_y, x, y, TFT_YELLOW);
+    }
     last_x = x;
     last_y = y;
   }
@@ -455,6 +461,7 @@ extern "C" void app_main(void)
     spr.setCursor(0,0);
     spr.setTextColor(TFT_WHITE);spr.setTextSize(1);spr.printf("RSSI=%d\n", rssi);
     spr.printf("AMP_HE-LTF = %2.2f\n", heltf_amp);
+    spr.printf("NON-HE PKTS = %d\n", non_he_pkt_count);
     connect_csi_plots(heltf, TFT_MAGENTA, heltf_amp);
     spr.pushSprite(&lcd, 0, 0);
 
