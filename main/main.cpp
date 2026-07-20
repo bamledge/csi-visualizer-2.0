@@ -1,4 +1,5 @@
 #include "sdkconfig.h"
+#include <math.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -25,6 +26,9 @@
 #include "esp_event.h"
 
 #define CONFIG_SEND_FREQUENCY      100
+#define CSI_PDD_CANCELLATION_ENABLED    0
+#define CSI_DATA_LOG_ENABLED            0
+
 #if CONFIG_IDF_TARGET_ESP32C5 || CONFIG_IDF_TARGET_ESP32C61
 #define CSI_FORCE_LLTF                      0
 #endif
@@ -40,8 +44,10 @@
 
 static const char *TAG = "csi-visualizer";
 
-#define WIFI_SSID      "BananaFi-2G"
-#define WIFI_PASS      "haruhiyo01040312"
+static_assert(sizeof(CONFIG_CSI_WIFI_SSID) - 1 <= sizeof(wifi_sta_config_t::ssid),
+              "Wi-Fi SSID must be 32 bytes or fewer");
+static_assert(sizeof(CONFIG_CSI_WIFI_PASSWORD) - 1 <= sizeof(wifi_sta_config_t::password),
+              "Wi-Fi password must be 64 bytes or fewer");
 
 static EventGroupHandle_t wifi_event_group;
 #define WIFI_CONNECTED_BIT BIT0
@@ -73,8 +79,10 @@ typedef struct comp {
 } csi_t;
 
 static csi_t heltf_raw[CSI_SIZE_HE_LTF], heltf[CSI_SIZE_HE_LTF];
+static csi_t heltf_snapshot[CSI_SIZE_HE_LTF];
 static float heltf_amp = -1;
-static unsigned int rssi;
+static float heltf_pdd_slope = 0;
+static int rssi;
 static unsigned int non_he_pkt_count = 0;
 
 const float CSI_ZOOM_RATIO = 50.0;
@@ -141,8 +149,10 @@ static void wifi_init_sta(void)
 
     wifi_config_t wifi_config = {};
 
-    strcpy((char *)wifi_config.sta.ssid, WIFI_SSID);
-    strcpy((char *)wifi_config.sta.password, WIFI_PASS);
+    memcpy(wifi_config.sta.ssid, CONFIG_CSI_WIFI_SSID,
+           sizeof(CONFIG_CSI_WIFI_SSID) - 1);
+    memcpy(wifi_config.sta.password, CONFIG_CSI_WIFI_PASSWORD,
+           sizeof(CONFIG_CSI_WIFI_PASSWORD) - 1);
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
 
@@ -161,37 +171,99 @@ static void wifi_init_sta(void)
 }
 
 
-void cancel_lo_ratation(csi_t *csi_raw, csi_t *csi, int csi_size)
+static void accumulate_adjacent_phase(const csi_t *csi, int start, int end,
+                                      double *sum_re, double *sum_im)
 {
-    // Get average phase
-    double sum_re = 0.0, sum_im = 0.0;
-    for (int k = CSI_SUBCARRIER_START_H; k < CSI_SUBCARRIER_END_H; k++) {
-        sum_re += csi_raw[k].re;
-        sum_im += csi_raw[k].im;
+    for (int k = start + 1; k <= end; k++) {
+        // csi[k] * conj(csi[k - 1]); its angle is the phase increment
+        // between adjacent sub-carriers. The magnitude naturally down-weights
+        // noisy, low-amplitude pairs.
+        *sum_re += csi[k].re * csi[k - 1].re + csi[k].im * csi[k - 1].im;
+        *sum_im += csi[k].im * csi[k - 1].re - csi[k].re * csi[k - 1].im;
     }
-    for (int k = CSI_SUBCARRIER_START_L; k < CSI_SUBCARRIER_END_L; k++) {
-        sum_re += csi_raw[k].re;
-        sum_im += csi_raw[k].im;
-    }
-    double theta = atan2(sum_im, sum_re);
+}
 
-    // Cancel the average phase (get rid of random rotation comes from Local Oscillator)
-    double cos_t = cos(-theta);
-    double sin_t = sin(-theta);
-    for (int k = 0; k < csi_size; k++) {
-        csi[k].re = csi_raw[k].re * cos_t - csi_raw[k].im * sin_t;
-        csi[k].im = csi_raw[k].re * sin_t + csi_raw[k].im * cos_t;
+#if CSI_PDD_CANCELLATION_ENABLED
+static int csi_buffer_to_subcarrier(int k)
+{
+#if CONFIG_IDF_TARGET_ESP32C5
+    // The observed HE-LTF buffer is in frequency order: -122...+122.
+    return k - (CSI_SIZE_HE_LTF / 2);
+#else
+    // Legacy 64-point CSI buffer order wraps after the positive frequencies.
+    return k < (CSI_SIZE_PER_LTF / 2) ? k : k - CSI_SIZE_PER_LTF;
+#endif
+}
+#endif
+
+float cancel_cfo_and_pdd_phase(const csi_t *csi_raw, csi_t *csi, int csi_size)
+{
+    // 1. Cancel CFO: common phase rotation across all sub-carriers.
+    // CFO appears as a common phase rotation across all sub-carriers in one
+    // CSI packet. Estimate it only from the active sub-carriers.
+    double sum_re = 0.0, sum_im = 0.0;
+    for (int k = CSI_SUBCARRIER_START_H; k <= CSI_SUBCARRIER_END_H; k++) {
+        sum_re += csi_raw[k].re;
+        sum_im += csi_raw[k].im;
     }
+    for (int k = CSI_SUBCARRIER_START_L; k <= CSI_SUBCARRIER_END_L; k++) {
+        sum_re += csi_raw[k].re;
+        sum_im += csi_raw[k].im;
+    }
+    // exp(-j * common_phase) is simply conj(sum) / |sum|. This avoids atan2,
+    // sin, and cos in the per-packet CFO path.
+    const double magnitude = sqrt(sum_re * sum_re + sum_im * sum_im);
+    double cos_t = 1.0;
+    double sin_t = 0.0;
+    if (magnitude > 1e-12) {
+        const double inv_magnitude = 1.0 / magnitude;
+        cos_t = sum_re * inv_magnitude;
+        sin_t = -sum_im * inv_magnitude;
+    }
+    for (int k = 0; k < csi_size; k++) {
+        // Local copies make in-place use (csi_raw == csi) safe.
+        const float re = csi_raw[k].re;
+        const float im = csi_raw[k].im;
+        csi[k].re = re * cos_t - im * sin_t;
+        csi[k].im = re * sin_t + im * cos_t;
+    }
+
+    // 2. Cancel PDD: linear phase slope over the sub-carrier index.
+    // Estimate the slope without explicit phase unwrapping by averaging
+    // adjacent-sub-carrier phase increments after CFO cancellation.
+    double slope_sum_re = 0.0, slope_sum_im = 0.0;
+    accumulate_adjacent_phase(csi, CSI_SUBCARRIER_START_H,
+                              CSI_SUBCARRIER_END_H, &slope_sum_re, &slope_sum_im);
+    accumulate_adjacent_phase(csi, CSI_SUBCARRIER_START_L,
+                              CSI_SUBCARRIER_END_L, &slope_sum_re, &slope_sum_im);
+
+    double phase_slope = 0.0;
+    if (slope_sum_re * slope_sum_re + slope_sum_im * slope_sum_im > 1e-24) {
+        phase_slope = atan2(slope_sum_im, slope_sum_re);
+    }
+
+#if CSI_PDD_CANCELLATION_ENABLED
+    for (int k = 0; k < csi_size; k++) {
+        const double theta = -phase_slope * csi_buffer_to_subcarrier(k);
+        const double pdd_cos = cos(theta);
+        const double pdd_sin = sin(theta);
+        const float re = csi[k].re;
+        const float im = csi[k].im;
+        csi[k].re = re * pdd_cos - im * pdd_sin;
+        csi[k].im = re * pdd_sin + im * pdd_cos;
+    }
+#endif
+    return phase_slope;
 }
 
 float normalize_packet_rms(csi_t *csi)
 {
     double pwr = 0.0; int cnt = 0;
-    for (int k = CSI_SUBCARRIER_START_H; k < CSI_SUBCARRIER_END_H; k++) {
+    for (int k = CSI_SUBCARRIER_START_H; k <= CSI_SUBCARRIER_END_H; k++) {
         pwr += csi[k].re*csi[k].re + csi[k].im*csi[k].im;
         cnt++;
     }
-    for (int k = CSI_SUBCARRIER_START_L; k < CSI_SUBCARRIER_END_L; k++) {
+    for (int k = CSI_SUBCARRIER_START_L; k <= CSI_SUBCARRIER_END_L; k++) {
         pwr += csi[k].re*csi[k].re + csi[k].im*csi[k].im;
         cnt++;
     }
@@ -199,11 +271,11 @@ float normalize_packet_rms(csi_t *csi)
     double rms = sqrt(pwr / (double)cnt);
     if (rms < 1e-12) return -1.0;
     double inv = 1.0 / rms;
-    for (int k = CSI_SUBCARRIER_START_H; k < CSI_SUBCARRIER_END_H; k++) {
+    for (int k = CSI_SUBCARRIER_START_H; k <= CSI_SUBCARRIER_END_H; k++) {
         csi[k].re *= inv;
         csi[k].im *= inv;
     }
-    for (int k = CSI_SUBCARRIER_START_L; k < CSI_SUBCARRIER_END_L; k++) {
+    for (int k = CSI_SUBCARRIER_START_L; k <= CSI_SUBCARRIER_END_L; k++) {
         csi[k].re *= inv;
         csi[k].im *= inv;
     }
@@ -243,15 +315,16 @@ static void wifi_csi_rx_cb(void *ctx, wifi_csi_info_t *info)
     ESP_LOGD(TAG, "compensate_gain %f, agc_gain %d, fft_gain %d", compensate_gain, agc_gain, fft_gain);
 #endif
 
+#if CSI_DATA_LOG_ENABLED
 #if CONFIG_IDF_TARGET_ESP32C5 || CONFIG_IDF_TARGET_ESP32C6 || CONFIG_IDF_TARGET_ESP32C61
     if (!s_count) {
         ESP_LOGI(TAG, "================ CSI RECV ================");
         ets_printf("type,seq,mac,rssi,rate,noise_floor,fft_gain,agc_gain,channel,local_timestamp,sig_len,rx_format,len,first_word,data\n");
     }
-    /*ets_printf("CSI_DATA,%d," MACSTR ",%d,%d,%d,%d,%d,%d,%d,%d,%d",
+    ets_printf("CSI_DATA,%d," MACSTR ",%d,%d,%d,%d,%d,%d,%d,%d,%d",
                s_count, MAC2STR(info->mac), rx_ctrl->rssi, rx_ctrl->rate,
                rx_ctrl->noise_floor, fft_gain, agc_gain, rx_ctrl->channel,
-               rx_ctrl->timestamp, rx_ctrl->sig_len, rx_ctrl->cur_bb_format);*/
+               rx_ctrl->timestamp, rx_ctrl->sig_len, rx_ctrl->cur_bb_format);
 #else
     if (!s_count) {
         ESP_LOGI(TAG, "================ CSI RECV ================");
@@ -266,38 +339,53 @@ static void wifi_csi_rx_cb(void *ctx, wifi_csi_info_t *info)
 #endif
 
 #if (CONFIG_IDF_TARGET_ESP32C5 || CONFIG_IDF_TARGET_ESP32C61) && CSI_FORCE_LLTF
-
     int16_t csi = ((int16_t)(((((uint16_t)info->buf[1]) << 8) | info->buf[0]) << 4) >> 4);
-    ets_printf(",%d,%d,\"[%d", (info->len - 2) / 2, info->first_word_invalid, (int16_t)(compensate_gain * csi));
+    ets_printf(",%d,%d,\"[%d", (info->len - 2) / 2, info->first_word_invalid,
+               (int16_t)(compensate_gain * csi));
     for (int i = 2; i < (info->len - 2); i += 2) {
         csi = ((int16_t)(((((uint16_t)info->buf[i + 1]) << 8) | info->buf[i]) << 4) >> 4);
         ets_printf(",%d", (int16_t)(compensate_gain * csi));
     }
-
 #else
-    //ets_printf(",%d,%d,\"[%d", info->len, info->first_word_invalid, (int16_t)(compensate_gain * info->buf[0]));
-    /*for (int i = 1; i < info->len; i++) {
+    ets_printf(",%d,%d,\"[%d", info->len, info->first_word_invalid,
+               (int16_t)(compensate_gain * info->buf[0]));
+    /* Keep packet logging lightweight; enable this loop only when full CSI
+       dumps are explicitly needed. */
+    /*
+    for (int i = 1; i < info->len; i++) {
         ets_printf(",%d", (int16_t)(compensate_gain * info->buf[i]));
-    }*/
+    }
+    */
 #endif
-    //ets_printf("]\"\n");
+    ets_printf("]\"\n");
+#endif
     s_count++;
 
     if (rx_ctrl->cur_bb_format != RX_BB_FORMAT_HE_SU) {
-        non_he_pkt_count++;
+        if (xCsiMutex != NULL &&
+            xSemaphoreTake(xCsiMutex, portMAX_DELAY) == pdTRUE) {
+            non_he_pkt_count++;
+            xSemaphoreGive(xCsiMutex);
+        }
+        return;
+    }
+
+    if (info->len < CSI_SIZE_HE_LTF * 2) {
+        ESP_LOGW(TAG, "Unexpected HE CSI length: %u", info->len);
         return;
     }
 
     for (int k = 0; k < CSI_SIZE_HE_LTF; k++) {
         // HE-LTF
-        heltf_raw[k].re = (float) info->buf[k * 2];
-        heltf_raw[k].im = (float) info->buf[(k * 2) + 1];
+        heltf_raw[k].im = (float) info->buf[k * 2];
+        heltf_raw[k].re = (float) info->buf[(k * 2) + 1];
     }
-    rssi = rx_ctrl->rssi;
     if (xCsiMutex != NULL) {
         if (xSemaphoreTake(xCsiMutex, portMAX_DELAY) == pdTRUE) {
-            cancel_lo_ratation(heltf_raw, heltf, CSI_SIZE_HE_LTF);
+            heltf_pdd_slope = cancel_cfo_and_pdd_phase(heltf_raw, heltf,
+                                                       CSI_SIZE_HE_LTF);
             heltf_amp = normalize_packet_rms(heltf);
+            rssi = rx_ctrl->rssi;
             xSemaphoreGive(xCsiMutex);
         }
     }
@@ -320,7 +408,7 @@ static void wifi_csi_init()
         .acquire_csi_mu           = true,
         .acquire_csi_dcm          = true,
         .acquire_csi_beamformed   = true,
-        .acquire_csi_he_stbc_mode = 2,
+        .acquire_csi_he_stbc_mode = ESP_CSI_ACQUIRE_STBC_HELTF1,
         .val_scale_cfg            = 0,
         .dump_ack_en              = false,
         .lltf_bit_mode            = false,
@@ -391,22 +479,45 @@ void plot_csi_in_phasor(csi_t *csi, int color, float amplitude) {
     color = lcd.color565(64,64,64);
   }
   // Positive sub-carrier
-  for (int k = CSI_SUBCARRIER_START_H; k < CSI_SUBCARRIER_END_H; k++) {
+  for (int k = CSI_SUBCARRIER_START_H; k <= CSI_SUBCARRIER_END_H; k++) {
     spr.drawPixel(_hw + (csi[k].re * CSI_ZOOM_RATIO), _hh + (csi[k].im * CSI_ZOOM_RATIO), color);
   }
   // Negative sub-carrier
-  for (int k = CSI_SUBCARRIER_START_L; k < CSI_SUBCARRIER_END_L; k++) {
+  for (int k = CSI_SUBCARRIER_START_L; k <= CSI_SUBCARRIER_END_L; k++) {
     spr.drawPixel(_hw + (csi[k].re * CSI_ZOOM_RATIO), _hh + (csi[k].im * CSI_ZOOM_RATIO), color);
   }
 }
 
-void connect_csi_plots(csi_t *csi, int color, float amplitude) {
-  int x, y, last_x, last_y;
-  if (amplitude <= CSI_AMP_THRESHOLD) {
-    color = lcd.color565(64,64,64);
+static int rssi_to_plot_color(int value)
+{
+  static const uint8_t colors[10][3] = {
+    {  0,   0, 128}, // #000080
+    {  0,   0, 170}, // #0000AA
+    {  0,   0, 213}, // #0000D5
+    {  0,   0, 255}, // #0000FF
+    { 43,  43, 255}, // #2B2BFF
+    { 85,  85, 255}, // #5555FF
+    {128, 128, 255}, // #8080FF
+    {170, 170, 255}, // #AAAAFF
+    {213, 213, 255}, // #D5D5FF
+    {255, 255, 255}, // #FFFFFF
+  };
+
+  // Divide -80...-30 dBm into 5 dB steps. Values outside the range use
+  // the weakest/strongest endpoint color.
+  int index = (value + 80) / 5;
+  if (value <= -80) {
+    index = 0;
+  } else if (value >= -30) {
+    index = 9;
   }
+  return lcd.color565(colors[index][0], colors[index][1], colors[index][2]);
+}
+
+void connect_csi_plots(csi_t *csi, int color) {
+  int x, y, last_x, last_y;
   // Negative sub-carrier
-  for (int k = CSI_SUBCARRIER_START_L; k < CSI_SUBCARRIER_END_L; k++) {
+  for (int k = CSI_SUBCARRIER_START_L; k <= CSI_SUBCARRIER_END_L; k++) {
         x = _hw + (csi[k].re * CSI_ZOOM_RATIO);
     y = _hh + (csi[k].im * CSI_ZOOM_RATIO);
     if (k != CSI_SUBCARRIER_START_L) {
@@ -416,13 +527,11 @@ void connect_csi_plots(csi_t *csi, int color, float amplitude) {
     last_y = y;
   }
   // Positive sub-carrier
-  for (int k = CSI_SUBCARRIER_START_H; k < CSI_SUBCARRIER_END_H; k++) {
+  for (int k = CSI_SUBCARRIER_START_H; k <= CSI_SUBCARRIER_END_H; k++) {
     x = _hw + (csi[k].re * CSI_ZOOM_RATIO);
     y = _hh + (csi[k].im * CSI_ZOOM_RATIO);
-    if (k != CSI_SUBCARRIER_START_H) {
-      spr.drawLine(last_x, last_y, x, y, color);
-      //spr.drawLine(last_x, last_y, x, y, TFT_YELLOW);
-    }
+    // Bridge -2 to +2 across the invalid DC carriers (-1, 0, +1).
+    spr.drawLine(last_x, last_y, x, y, color);
     last_x = x;
     last_y = y;
   }
@@ -432,7 +541,7 @@ extern "C" void app_main(void)
 {
   xCsiMutex = xSemaphoreCreateMutex();
   lcd.init();
-  setupLGFX(16, ROT0);
+  setupLGFX(16, ROT90);
   uint32_t sz = _w * _h;
 
   printf("w=%ld h=%ld\n",
@@ -446,7 +555,16 @@ extern "C" void app_main(void)
       sleep(1);
     };
   }
-  printf("init done\n");
+  spr.fillSprite(TFT_BLACK);
+  spr.drawLine(0, _hh, _w, _hh, TFT_DARKGRAY);spr.drawLine(_hw, 0, _hw, _h, TFT_DARKGRAY);
+  spr.setCursor(0,0);
+  spr.setTextColor(TFT_WHITE);spr.setTextSize(1);spr.printf("RSSI=%d\n", rssi);
+  spr.printf("AMP_HE-LTF = %2.2f\n", heltf_amp);
+  spr.printf("PDD SLOPE = %+.4f rad/sc\n", heltf_pdd_slope);
+  spr.printf("PDD CANCEL = %s\n", CSI_PDD_CANCELLATION_ENABLED ? "ON" : "OFF");
+  spr.printf("NON-HE PKTS = %d\n", non_he_pkt_count);
+  spr.pushSprite(&lcd, 0, 0);
+
   ESP_ERROR_CHECK(nvs_flash_init());
   ESP_ERROR_CHECK(esp_netif_init());
   ESP_ERROR_CHECK(esp_event_loop_create_default());
@@ -456,13 +574,32 @@ extern "C" void app_main(void)
   wifi_ping_router_start();
 
   while(1) {
+    float snapshot_amp = -1;
+    float snapshot_pdd_slope = 0;
+    int snapshot_rssi = 0;
+    unsigned int snapshot_non_he_pkt_count = 0;
+
+    // Keep the critical section short: copy one complete CSI packet and draw
+    // the snapshot after releasing the mutex so the Wi-Fi task is not blocked
+    // by LCD operations.
+    if (xSemaphoreTake(xCsiMutex, portMAX_DELAY) == pdTRUE) {
+      memcpy(heltf_snapshot, heltf, sizeof(heltf_snapshot));
+      snapshot_amp = heltf_amp;
+      snapshot_pdd_slope = heltf_pdd_slope;
+      snapshot_rssi = rssi;
+      snapshot_non_he_pkt_count = non_he_pkt_count;
+      xSemaphoreGive(xCsiMutex);
+    }
+
     spr.fillSprite(TFT_BLACK);
     spr.drawLine(0, _hh, _w, _hh, TFT_DARKGRAY);spr.drawLine(_hw, 0, _hw, _h, TFT_DARKGRAY);
     spr.setCursor(0,0);
-    spr.setTextColor(TFT_WHITE);spr.setTextSize(1);spr.printf("RSSI=%d\n", rssi);
-    spr.printf("AMP_HE-LTF = %2.2f\n", heltf_amp);
-    spr.printf("NON-HE PKTS = %d\n", non_he_pkt_count);
-    connect_csi_plots(heltf, TFT_MAGENTA, heltf_amp);
+    spr.setTextColor(TFT_WHITE);spr.setTextSize(1);spr.printf("RSSI=%d\n", snapshot_rssi);
+    spr.printf("AMP_HE-LTF = %2.2f\n", snapshot_amp);
+    spr.printf("PDD SLOPE = %+.4f rad/sc\n", snapshot_pdd_slope);
+    spr.printf("PDD CANCEL = %s\n", CSI_PDD_CANCELLATION_ENABLED ? "ON" : "OFF");
+    spr.printf("NON-HE PKTS = %u\n", snapshot_non_he_pkt_count);
+    connect_csi_plots(heltf_snapshot, rssi_to_plot_color(snapshot_rssi));
     spr.pushSprite(&lcd, 0, 0);
 
     vTaskDelay(10);
