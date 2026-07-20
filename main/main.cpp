@@ -53,10 +53,14 @@ static EventGroupHandle_t wifi_event_group;
 #define CSI_SIZE_L_LTF 54
 #define CSI_SIZE_HT_LTF 57
 #define CSI_SIZE_HE_LTF 245
-#define CSI_SUBCARRIER_START_L 0
+// The C5 HE-LTF buffer is ordered as k=-122...+122. In normal captures,
+// the adjacent phase-difference direction reverses near |k|=82, so observe
+// only the phase-consistent center region while continuing to skip the
+// invalid DC-adjacent carriers.
+#define CSI_SUBCARRIER_START_L 40   // k = -82
 #define CSI_SUBCARRIER_END_L   120
 #define CSI_SUBCARRIER_START_H 123
-#define CSI_SUBCARRIER_END_H   244
+#define CSI_SUBCARRIER_END_H   204  // k = +82
 #else
 // For ESP32
 #define NUM_CSI_PARTS = 3
@@ -66,6 +70,13 @@ static EventGroupHandle_t wifi_event_group;
 #define CSI_SUBCARRIER_START_L 38
 #define CSI_SUBCARRIER_END_L   62
 #endif
+
+#if CONFIG_CSI_LOS_GUIDE_ENABLED
+#define LOS_GUIDE_MIN_RSSI -52
+#define LOS_GUIDE_Y_WIDTH_ON_MIN_RSSI 15
+#define LOS_GUIDE_Y_WIDTH_ON_MAX_RSSI 30
+#endif
+
 
 SemaphoreHandle_t mutex = xSemaphoreCreateMutex();
 
@@ -277,6 +288,7 @@ float normalize_packet_rms(csi_t *csi)
     return rms;
 }
 
+#if CONFIG_CSI_INVALID_FILTER_ENABLED
 static void inspect_he_csi_range(const int8_t *buf, int start, int end,
                                  int *max_zero_run, int *phase_reversal_count)
 {
@@ -336,6 +348,7 @@ static bool is_valid_he_csi(const int8_t *buf)
     // with an ESP32-C5 SoftAP.
     return max_zero_run < 4 && phase_reversal_count < 8;
 }
+#endif
 
 static void wifi_csi_rx_cb(void *ctx, wifi_csi_info_t *info)
 {
@@ -443,6 +456,7 @@ static void wifi_csi_rx_cb(void *ctx, wifi_csi_info_t *info)
         return;
     }
 
+#if CONFIG_CSI_INVALID_FILTER_ENABLED
     if (!is_valid_he_csi(info->buf)) {
         // Keep metadata such as RSSI current, but retain the last valid CSI
         // shape instead of replacing it with a malformed packet.
@@ -454,6 +468,7 @@ static void wifi_csi_rx_cb(void *ctx, wifi_csi_info_t *info)
         }
         return;
     }
+#endif
 
     for (int k = 0; k < CSI_SIZE_HE_LTF; k++) {
         // HE-LTF
@@ -611,6 +626,59 @@ static float rssi_to_zoom_ratio(int value)
 #endif
 }
 
+#if CONFIG_CSI_LOS_GUIDE_ENABLED
+static int los_guide_left_x()
+{
+  return _hw + rssi_to_zoom_ratio(LOS_GUIDE_MIN_RSSI);
+}
+
+static void draw_los_guide()
+{
+  const int left = los_guide_left_x();
+
+  spr.drawLine(left, _hh - LOS_GUIDE_Y_WIDTH_ON_MIN_RSSI,
+               left, _hh + LOS_GUIDE_Y_WIDTH_ON_MIN_RSSI, TFT_YELLOW);
+  spr.drawLine(left, _hh - LOS_GUIDE_Y_WIDTH_ON_MIN_RSSI,
+               _w, _hh - LOS_GUIDE_Y_WIDTH_ON_MAX_RSSI, TFT_YELLOW);
+  spr.drawLine(left, _hh + LOS_GUIDE_Y_WIDTH_ON_MIN_RSSI,
+               _w, _hh + LOS_GUIDE_Y_WIDTH_ON_MAX_RSSI, TFT_YELLOW);
+}
+
+static bool is_csi_point_inside_los_guide(const csi_t &point,
+                                          float zoom_ratio)
+{
+  const int left = los_guide_left_x();
+  const int right = _w;
+  const int x = _hw + point.re * zoom_ratio;
+  const int y = _hh + point.im * zoom_ratio;
+
+  if (right <= left || x < left || x > right) {
+    return false;
+  }
+
+  const float position = (float)(x - left) / (right - left);
+  const float half_height = LOS_GUIDE_Y_WIDTH_ON_MIN_RSSI +
+      position * (LOS_GUIDE_Y_WIDTH_ON_MAX_RSSI -
+                  LOS_GUIDE_Y_WIDTH_ON_MIN_RSSI);
+  return fabsf(y - _hh) <= half_height;
+}
+
+static bool is_csi_inside_los_guide(const csi_t *csi, float zoom_ratio)
+{
+  for (int k = CSI_SUBCARRIER_START_L; k <= CSI_SUBCARRIER_END_L; k++) {
+    if (!is_csi_point_inside_los_guide(csi[k], zoom_ratio)) {
+      return false;
+    }
+  }
+  for (int k = CSI_SUBCARRIER_START_H; k <= CSI_SUBCARRIER_END_H; k++) {
+    if (!is_csi_point_inside_los_guide(csi[k], zoom_ratio)) {
+      return false;
+    }
+  }
+  return true;
+}
+#endif
+
 void connect_csi_plots(csi_t *csi, int color, float zoom_ratio) {
   int x, y, last_x, last_y;
   // Negative sub-carrier
@@ -654,11 +722,15 @@ extern "C" void app_main(void)
   }
   spr.fillSprite(TFT_BLACK);
   spr.drawLine(0, _hh, _w, _hh, TFT_DARKGRAY);spr.drawLine(_hw, 0, _hw, _h, TFT_DARKGRAY);
+#if CONFIG_CSI_LOS_GUIDE_ENABLED
+  draw_los_guide();
+#endif
   spr.setCursor(0,0);
   spr.setTextColor(TFT_WHITE);spr.setTextSize(1);spr.printf("RSSI=%d\n", rssi);
   spr.printf("AMP_HE-LTF = %2.2f\n", heltf_amp);
   spr.printf("INVALID CSI = %u\n", invalid_csi_count);
   spr.printf("NON-HE PKTS = %d\n", non_he_pkt_count);
+  spr.printf("\n\nWaiting for connection complete.....\n");
   spr.pushSprite(&lcd, 0, 0);
 
   ESP_ERROR_CHECK(nvs_flash_init());
@@ -687,16 +759,33 @@ extern "C" void app_main(void)
       xSemaphoreGive(xCsiMutex);
     }
 
+    const float snapshot_zoom_ratio = rssi_to_zoom_ratio(snapshot_rssi);
+#if CONFIG_CSI_LOS_GUIDE_ENABLED
+    const bool snapshot_csi_inside_los_guide =
+        snapshot_amp >= 0.0f &&
+        is_csi_inside_los_guide(heltf_snapshot, snapshot_zoom_ratio);
+#endif
+    int snapshot_plot_color = rssi_to_plot_color(snapshot_rssi);
+
     spr.fillSprite(TFT_BLACK);
     spr.drawLine(0, _hh, _w, _hh, TFT_DARKGRAY);spr.drawLine(_hw, 0, _hw, _h, TFT_DARKGRAY);
+#if CONFIG_CSI_LOS_GUIDE_ENABLED
+    draw_los_guide();
+#endif
     spr.setCursor(0,0);
     spr.setTextColor(TFT_WHITE);spr.setTextSize(1);spr.printf("RSSI=%d\n", snapshot_rssi);
     spr.printf("AMP_HE-LTF = %2.2f\n", snapshot_amp);
     spr.printf("INVALID CSI = %u\n", snapshot_invalid_csi_count);
     spr.printf("NON-HE PKTS = %u\n", snapshot_non_he_pkt_count);
+#if CONFIG_CSI_LOS_GUIDE_ENABLED
+    if(snapshot_csi_inside_los_guide) {
+      spr.setTextColor(TFT_YELLOW);spr.printf("\n\n Line Of Sight!!!\n");
+      snapshot_plot_color = TFT_YELLOW;
+    }
+#endif
     connect_csi_plots(heltf_snapshot,
-                      rssi_to_plot_color(snapshot_rssi),
-                      rssi_to_zoom_ratio(snapshot_rssi));
+                      snapshot_plot_color,
+                      snapshot_zoom_ratio);
     spr.pushSprite(&lcd, 0, 0);
 
     vTaskDelay(10);
