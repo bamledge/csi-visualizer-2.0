@@ -25,10 +25,6 @@
 #include "esp_csi_gain_ctrl.h"
 #include "esp_event.h"
 
-#define CONFIG_SEND_FREQUENCY      100
-#define CSI_PDD_CANCELLATION_ENABLED    0
-#define CSI_DATA_LOG_ENABLED            0
-
 #if CONFIG_IDF_TARGET_ESP32C5 || CONFIG_IDF_TARGET_ESP32C61
 #define CSI_FORCE_LLTF                      0
 #endif
@@ -81,9 +77,9 @@ typedef struct comp {
 static csi_t heltf_raw[CSI_SIZE_HE_LTF], heltf[CSI_SIZE_HE_LTF];
 static csi_t heltf_snapshot[CSI_SIZE_HE_LTF];
 static float heltf_amp = -1;
-static float heltf_pdd_slope = 0;
 static int rssi;
 static unsigned int non_he_pkt_count = 0;
+static unsigned int invalid_csi_count = 0;
 
 const float CSI_ZOOM_RATIO = 50.0;
 const float CSI_AMP_THRESHOLD = 10.0;
@@ -183,7 +179,7 @@ static void accumulate_adjacent_phase(const csi_t *csi, int start, int end,
     }
 }
 
-#if CSI_PDD_CANCELLATION_ENABLED
+#if CONFIG_CSI_PDD_CANCELLATION_ENABLED
 static int csi_buffer_to_subcarrier(int k)
 {
 #if CONFIG_IDF_TARGET_ESP32C5
@@ -242,7 +238,7 @@ float cancel_cfo_and_pdd_phase(const csi_t *csi_raw, csi_t *csi, int csi_size)
         phase_slope = atan2(slope_sum_im, slope_sum_re);
     }
 
-#if CSI_PDD_CANCELLATION_ENABLED
+#if CONFIG_CSI_PDD_CANCELLATION_ENABLED
     for (int k = 0; k < csi_size; k++) {
         const double theta = -phase_slope * csi_buffer_to_subcarrier(k);
         const double pdd_cos = cos(theta);
@@ -282,6 +278,66 @@ float normalize_packet_rms(csi_t *csi)
     return rms;
 }
 
+static void inspect_he_csi_range(const int8_t *buf, int start, int end,
+                                 int *max_zero_run, int *phase_reversal_count)
+{
+    int zero_run = 0;
+
+    for (int k = start; k <= end; k++) {
+        const int im = buf[k * 2];
+        const int re = buf[(k * 2) + 1];
+
+        if (re == 0 && im == 0) {
+            zero_run++;
+            if (zero_run > *max_zero_run) {
+                *max_zero_run = zero_run;
+            }
+        } else {
+            zero_run = 0;
+        }
+
+        if (k == start) {
+            continue;
+        }
+
+        const int prev_im = buf[(k - 1) * 2];
+        const int prev_re = buf[((k - 1) * 2) + 1];
+        const int power = re * re + im * im;
+        const int prev_power = prev_re * prev_re + prev_im * prev_im;
+
+        // Ignore phase at very weak points, where quantization makes it
+        // unstable. For the remaining pairs, count changes greater than
+        // about 143 degrees (cos(theta) < -0.8) as near-pi reversals.
+        if (power >= 16 && prev_power >= 16) {
+            const int dot = re * prev_re + im * prev_im;
+            if (dot < 0 &&
+                (int64_t)dot * dot * 100 >=
+                    (int64_t)power * prev_power * 64) {
+                (*phase_reversal_count)++;
+            }
+        }
+    }
+}
+
+static bool is_valid_he_csi(const int8_t *buf)
+{
+    int max_zero_run = 0;
+    int phase_reversal_count = 0;
+
+    inspect_he_csi_range(buf, CSI_SUBCARRIER_START_L,
+                         CSI_SUBCARRIER_END_L, &max_zero_run,
+                         &phase_reversal_count);
+    inspect_he_csi_range(buf, CSI_SUBCARRIER_START_H,
+                         CSI_SUBCARRIER_END_H, &max_zero_run,
+                         &phase_reversal_count);
+
+    // A contiguous spectral notch does not produce exact complex zeros over
+    // this many active subcarriers. Numerous near-pi reversals in one packet
+    // likewise indicate the partially overwritten C5 HE-CSI buffer observed
+    // with an ESP32-C5 SoftAP.
+    return max_zero_run < 4 && phase_reversal_count < 8;
+}
+
 static void wifi_csi_rx_cb(void *ctx, wifi_csi_info_t *info)
 {
     if (!info || !info->buf) {
@@ -315,11 +371,15 @@ static void wifi_csi_rx_cb(void *ctx, wifi_csi_info_t *info)
     ESP_LOGD(TAG, "compensate_gain %f, agc_gain %d, fft_gain %d", compensate_gain, agc_gain, fft_gain);
 #endif
 
-#if CSI_DATA_LOG_ENABLED
+#if CONFIG_CSI_DATA_LOG_METADATA_ENABLED
 #if CONFIG_IDF_TARGET_ESP32C5 || CONFIG_IDF_TARGET_ESP32C6 || CONFIG_IDF_TARGET_ESP32C61
     if (!s_count) {
         ESP_LOGI(TAG, "================ CSI RECV ================");
-        ets_printf("type,seq,mac,rssi,rate,noise_floor,fft_gain,agc_gain,channel,local_timestamp,sig_len,rx_format,len,first_word,data\n");
+        ets_printf("type,seq,mac,rssi,rate,noise_floor,fft_gain,agc_gain,channel,local_timestamp,sig_len,rx_format,len,first_word"
+#if CONFIG_CSI_DATA_LOG_BYTES_ENABLED
+                   ",data"
+#endif
+                   "\n");
     }
     ets_printf("CSI_DATA,%d," MACSTR ",%d,%d,%d,%d,%d,%d,%d,%d,%d",
                s_count, MAC2STR(info->mac), rx_ctrl->rssi, rx_ctrl->rate,
@@ -328,7 +388,11 @@ static void wifi_csi_rx_cb(void *ctx, wifi_csi_info_t *info)
 #else
     if (!s_count) {
         ESP_LOGI(TAG, "================ CSI RECV ================");
-        ets_printf("type,id,mac,rssi,rate,sig_mode,mcs,bandwidth,smoothing,not_sounding,aggregation,stbc,fec_coding,sgi,noise_floor,ampdu_cnt,channel,secondary_channel,local_timestamp,ant,sig_len,rx_format,len,first_word,data\n");
+        ets_printf("type,id,mac,rssi,rate,sig_mode,mcs,bandwidth,smoothing,not_sounding,aggregation,stbc,fec_coding,sgi,noise_floor,ampdu_cnt,channel,secondary_channel,local_timestamp,ant,sig_len,rx_format,len,first_word"
+#if CONFIG_CSI_DATA_LOG_BYTES_ENABLED
+                   ",data"
+#endif
+                   "\n");
     }
     ets_printf("CSI_DATA,%d," MACSTR ",%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d",
                s_count, MAC2STR(info->mac), rx_ctrl->rssi, rx_ctrl->rate, rx_ctrl->sig_mode,
@@ -339,25 +403,30 @@ static void wifi_csi_rx_cb(void *ctx, wifi_csi_info_t *info)
 #endif
 
 #if (CONFIG_IDF_TARGET_ESP32C5 || CONFIG_IDF_TARGET_ESP32C61) && CSI_FORCE_LLTF
-    int16_t csi = ((int16_t)(((((uint16_t)info->buf[1]) << 8) | info->buf[0]) << 4) >> 4);
-    ets_printf(",%d,%d,\"[%d", (info->len - 2) / 2, info->first_word_invalid,
-               (int16_t)(compensate_gain * csi));
-    for (int i = 2; i < (info->len - 2); i += 2) {
-        csi = ((int16_t)(((((uint16_t)info->buf[i + 1]) << 8) | info->buf[i]) << 4) >> 4);
-        ets_printf(",%d", (int16_t)(compensate_gain * csi));
+    const int sample_count = info->len >= 2 ? (info->len - 2) / 2 : 0;
+    ets_printf(",%d,%d", sample_count, info->first_word_invalid);
+#if CONFIG_CSI_DATA_LOG_BYTES_ENABLED
+    ets_printf(",\"[");
+    for (int i = 0; i < sample_count; i++) {
+        const int offset = i * 2;
+        const int16_t csi = ((int16_t)(((((uint16_t)info->buf[offset + 1]) << 8) |
+                                        info->buf[offset]) << 4) >> 4);
+        ets_printf(i ? ",%d" : "%d", (int16_t)(compensate_gain * csi));
     }
-#else
-    ets_printf(",%d,%d,\"[%d", info->len, info->first_word_invalid,
-               (int16_t)(compensate_gain * info->buf[0]));
-    /* Keep packet logging lightweight; enable this loop only when full CSI
-       dumps are explicitly needed. */
-    /*
-    for (int i = 1; i < info->len; i++) {
-        ets_printf(",%d", (int16_t)(compensate_gain * info->buf[i]));
-    }
-    */
+    ets_printf("]\"");
 #endif
-    ets_printf("]\"\n");
+#else
+    ets_printf(",%d,%d", info->len, info->first_word_invalid);
+#if CONFIG_CSI_DATA_LOG_BYTES_ENABLED
+    ets_printf(",\"[");
+    for (int i = 0; i < info->len; i++) {
+        ets_printf(i ? ",%d" : "%d",
+                   (int16_t)(compensate_gain * info->buf[i]));
+    }
+    ets_printf("]\"");
+#endif
+#endif
+    ets_printf("\n");
 #endif
     s_count++;
 
@@ -375,6 +444,18 @@ static void wifi_csi_rx_cb(void *ctx, wifi_csi_info_t *info)
         return;
     }
 
+    if (!is_valid_he_csi(info->buf)) {
+        // Keep metadata such as RSSI current, but retain the last valid CSI
+        // shape instead of replacing it with a malformed packet.
+        if (xCsiMutex != NULL &&
+            xSemaphoreTake(xCsiMutex, portMAX_DELAY) == pdTRUE) {
+            rssi = rx_ctrl->rssi;
+            invalid_csi_count++;
+            xSemaphoreGive(xCsiMutex);
+        }
+        return;
+    }
+
     for (int k = 0; k < CSI_SIZE_HE_LTF; k++) {
         // HE-LTF
         heltf_raw[k].im = (float) info->buf[k * 2];
@@ -382,8 +463,7 @@ static void wifi_csi_rx_cb(void *ctx, wifi_csi_info_t *info)
     }
     if (xCsiMutex != NULL) {
         if (xSemaphoreTake(xCsiMutex, portMAX_DELAY) == pdTRUE) {
-            heltf_pdd_slope = cancel_cfo_and_pdd_phase(heltf_raw, heltf,
-                                                       CSI_SIZE_HE_LTF);
+            cancel_cfo_and_pdd_phase(heltf_raw, heltf, CSI_SIZE_HE_LTF);
             heltf_amp = normalize_packet_rms(heltf);
             rssi = rx_ctrl->rssi;
             xSemaphoreGive(xCsiMutex);
@@ -456,7 +536,7 @@ static esp_err_t wifi_ping_router_start()
 
     esp_ping_config_t ping_config = ESP_PING_DEFAULT_CONFIG();
     ping_config.count             = 0;
-    ping_config.interval_ms       = 1000 / CONFIG_SEND_FREQUENCY;
+    ping_config.interval_ms       = CONFIG_CSI_PING_INTERVAL_MS;
     ping_config.timeout_ms        = 20;
     ping_config.task_stack_size   = 3072;
     ping_config.data_size         = 1;
@@ -560,8 +640,7 @@ extern "C" void app_main(void)
   spr.setCursor(0,0);
   spr.setTextColor(TFT_WHITE);spr.setTextSize(1);spr.printf("RSSI=%d\n", rssi);
   spr.printf("AMP_HE-LTF = %2.2f\n", heltf_amp);
-  spr.printf("PDD SLOPE = %+.4f rad/sc\n", heltf_pdd_slope);
-  spr.printf("PDD CANCEL = %s\n", CSI_PDD_CANCELLATION_ENABLED ? "ON" : "OFF");
+  spr.printf("INVALID CSI = %u\n", invalid_csi_count);
   spr.printf("NON-HE PKTS = %d\n", non_he_pkt_count);
   spr.pushSprite(&lcd, 0, 0);
 
@@ -575,8 +654,8 @@ extern "C" void app_main(void)
 
   while(1) {
     float snapshot_amp = -1;
-    float snapshot_pdd_slope = 0;
     int snapshot_rssi = 0;
+    unsigned int snapshot_invalid_csi_count = 0;
     unsigned int snapshot_non_he_pkt_count = 0;
 
     // Keep the critical section short: copy one complete CSI packet and draw
@@ -585,8 +664,8 @@ extern "C" void app_main(void)
     if (xSemaphoreTake(xCsiMutex, portMAX_DELAY) == pdTRUE) {
       memcpy(heltf_snapshot, heltf, sizeof(heltf_snapshot));
       snapshot_amp = heltf_amp;
-      snapshot_pdd_slope = heltf_pdd_slope;
       snapshot_rssi = rssi;
+      snapshot_invalid_csi_count = invalid_csi_count;
       snapshot_non_he_pkt_count = non_he_pkt_count;
       xSemaphoreGive(xCsiMutex);
     }
@@ -596,8 +675,7 @@ extern "C" void app_main(void)
     spr.setCursor(0,0);
     spr.setTextColor(TFT_WHITE);spr.setTextSize(1);spr.printf("RSSI=%d\n", snapshot_rssi);
     spr.printf("AMP_HE-LTF = %2.2f\n", snapshot_amp);
-    spr.printf("PDD SLOPE = %+.4f rad/sc\n", snapshot_pdd_slope);
-    spr.printf("PDD CANCEL = %s\n", CSI_PDD_CANCELLATION_ENABLED ? "ON" : "OFF");
+    spr.printf("INVALID CSI = %u\n", snapshot_invalid_csi_count);
     spr.printf("NON-HE PKTS = %u\n", snapshot_non_he_pkt_count);
     connect_csi_plots(heltf_snapshot, rssi_to_plot_color(snapshot_rssi));
     spr.pushSprite(&lcd, 0, 0);
