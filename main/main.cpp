@@ -81,7 +81,6 @@ static int rssi;
 static unsigned int non_he_pkt_count = 0;
 static unsigned int invalid_csi_count = 0;
 
-const float CSI_ZOOM_RATIO = 50.0;
 const float CSI_AMP_THRESHOLD = 10.0;
 
 SemaphoreHandle_t xCsiMutex;
@@ -554,17 +553,17 @@ static esp_err_t wifi_ping_router_start()
     return ESP_OK;
 }
 
-void plot_csi_in_phasor(csi_t *csi, int color, float amplitude) {
+void plot_csi_in_phasor(csi_t *csi, int color, float amplitude, float zoom_ratio) {
   if (amplitude <= CSI_AMP_THRESHOLD) {
     color = lcd.color565(64,64,64);
   }
   // Positive sub-carrier
   for (int k = CSI_SUBCARRIER_START_H; k <= CSI_SUBCARRIER_END_H; k++) {
-    spr.drawPixel(_hw + (csi[k].re * CSI_ZOOM_RATIO), _hh + (csi[k].im * CSI_ZOOM_RATIO), color);
+    spr.drawPixel(_hw + (csi[k].re * zoom_ratio), _hh + (csi[k].im * zoom_ratio), color);
   }
   // Negative sub-carrier
   for (int k = CSI_SUBCARRIER_START_L; k <= CSI_SUBCARRIER_END_L; k++) {
-    spr.drawPixel(_hw + (csi[k].re * CSI_ZOOM_RATIO), _hh + (csi[k].im * CSI_ZOOM_RATIO), color);
+    spr.drawPixel(_hw + (csi[k].re * zoom_ratio), _hh + (csi[k].im * zoom_ratio), color);
   }
 }
 
@@ -594,12 +593,30 @@ static int rssi_to_plot_color(int value)
   return lcd.color565(colors[index][0], colors[index][1], colors[index][2]);
 }
 
-void connect_csi_plots(csi_t *csi, int color) {
+static float rssi_to_zoom_ratio(int value)
+{
+#if CONFIG_CSI_RSSI_ZOOM_ENABLED
+  if (value <= -80) {
+    return 25.0f;
+  }
+  if (value >= -30) {
+    return 150.0f;
+  }
+
+  // Linearly map -80...-30 dBm to 25...150.
+  return 25.0f + (value + 80) * 2.5f;
+#else
+  (void)value;
+  return 50.0f;
+#endif
+}
+
+void connect_csi_plots(csi_t *csi, int color, float zoom_ratio) {
   int x, y, last_x, last_y;
   // Negative sub-carrier
   for (int k = CSI_SUBCARRIER_START_L; k <= CSI_SUBCARRIER_END_L; k++) {
-        x = _hw + (csi[k].re * CSI_ZOOM_RATIO);
-    y = _hh + (csi[k].im * CSI_ZOOM_RATIO);
+    x = _hw + (csi[k].re * zoom_ratio);
+    y = _hh + (csi[k].im * zoom_ratio);
     if (k != CSI_SUBCARRIER_START_L) {
       spr.drawLine(last_x, last_y, x, y, color);
     }
@@ -608,8 +625,8 @@ void connect_csi_plots(csi_t *csi, int color) {
   }
   // Positive sub-carrier
   for (int k = CSI_SUBCARRIER_START_H; k <= CSI_SUBCARRIER_END_H; k++) {
-    x = _hw + (csi[k].re * CSI_ZOOM_RATIO);
-    y = _hh + (csi[k].im * CSI_ZOOM_RATIO);
+    x = _hw + (csi[k].re * zoom_ratio);
+    y = _hh + (csi[k].im * zoom_ratio);
     // Bridge -2 to +2 across the invalid DC carriers (-1, 0, +1).
     spr.drawLine(last_x, last_y, x, y, color);
     last_x = x;
@@ -677,7 +694,9 @@ extern "C" void app_main(void)
     spr.printf("AMP_HE-LTF = %2.2f\n", snapshot_amp);
     spr.printf("INVALID CSI = %u\n", snapshot_invalid_csi_count);
     spr.printf("NON-HE PKTS = %u\n", snapshot_non_he_pkt_count);
-    connect_csi_plots(heltf_snapshot, rssi_to_plot_color(snapshot_rssi));
+    connect_csi_plots(heltf_snapshot,
+                      rssi_to_plot_color(snapshot_rssi),
+                      rssi_to_zoom_ratio(snapshot_rssi));
     spr.pushSprite(&lcd, 0, 0);
 
     vTaskDelay(10);
