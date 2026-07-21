@@ -1,0 +1,64 @@
+menu "CSI Visualizer Configuration"
+
+    config CSI_WIFI_SSID
+        string "Wi-Fi SSID"
+        default ""
+        help
+            SSID of the Wi-Fi access point used to receive CSI data.
+
+    config CSI_WIFI_PASSWORD
+        string "Wi-Fi password"
+        default ""
+        help
+            Password of the Wi-Fi access point used to receive CSI data.
+
+    config CSI_PING_INTERVAL_MS
+        int "Ping interval (ms)"
+        range 1 60000
+        default 100
+        help
+            Interval in milliseconds between ping requests used to generate
+            Wi-Fi traffic and CSI samples.
+
+    config CSI_DATA_LOG_METADATA_ENABLED
+        bool "Log CSI metadata"
+        default n
+        help
+            Print metadata for each received CSI packet to the serial console.
+
+    config CSI_DATA_LOG_BYTES_ENABLED
+        bool "Log CSI sample data"
+        depends on CSI_DATA_LOG_METADATA_ENABLED
+        default n
+        help
+            Include the raw CSI sample values in the serial log. This can
+            produce a large amount of output.
+
+    config CSI_PDD_CANCELLATION_ENABLED
+        bool "Enable PDD phase cancellation"
+        default y
+        help
+            Estimate and remove the packet detection delay phase slope from
+            each CSI packet.
+
+    config CSI_RSSI_ZOOM_ENABLED
+        bool "Adjust plot zoom using RSSI"
+        default y
+        help
+            Adjust the CSI plot scale according to the received signal
+            strength.
+
+    config CSI_LOS_GUIDE_ENABLED
+        bool "Enable line-of-sight guide"
+        default y
+        help
+            Draw the line-of-sight guide and display the tentative LOS result.
+
+    config CSI_INVALID_FILTER_ENABLED
+        bool "Filter invalid CSI packets"
+        default n
+        help
+            Reject CSI packets containing suspicious zero runs or excessive
+            near-pi phase reversals.
+
+endmenu
